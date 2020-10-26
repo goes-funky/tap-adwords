@@ -150,7 +150,7 @@ def get_start_for_stream(customer_id, stream_name):
     return bk_start_date
 
 def apply_conversion_window(start_date):
-    conversion_window_days = int(CONFIG.get('conversion_window_days', '-30'))
+    conversion_window_days = int(CONFIG.get('conversion_window_days', '0'))
     return start_date+relativedelta(days=conversion_window_days)
 
 def get_end_date():
@@ -197,12 +197,20 @@ def add_synthetic_keys_to_stream_schema(stream_schema):
     return stream_schema
 
 def sync_report(stream_name, stream_metadata, sdk_client):
+
+    report_window_days = CONFIG.get("MAX_REPORT_TIME_WINDOW", 365)
+
+    is_incremental = False
+    if metadata.get(stream_metadata, (), "replication-method") == "INCREMENTAL":
+        is_incremental = True
+
     customer_id = sdk_client.client_customer_id
 
     stream_schema, _ = create_schema_for_report(stream_name, sdk_client)
     stream_schema = add_synthetic_keys_to_stream_schema(stream_schema)
 
     xml_attribute_list = get_fields_to_sync(stream_schema, stream_metadata)
+
 
     primary_keys = metadata.get(stream_metadata, (), 'tap-adwords.report-key-properties') or []
     LOGGER.info("{} primary keys are {}".format(stream_name, primary_keys))
@@ -216,6 +224,9 @@ def sync_report(stream_name, stream_metadata, sdk_client):
     check_selected_fields(stream_name, field_list, sdk_client)
     # If an attribution window sync is interrupted, start where it left off
     start_date = get_attribution_window_bookmark(customer_id, stream_name)
+    if start_date is not None:
+        start_date = start_date + relativedelta(days=1)
+
     if start_date is None:
         start_date = apply_conversion_window(get_start_for_stream(customer_id, stream_name))
 
@@ -226,17 +237,37 @@ def sync_report(stream_name, stream_metadata, sdk_client):
 
     LOGGER.info('Selected fields: %s', field_list)
 
-    while start_date <= get_end_date():
-        sync_report_for_day(stream_name, stream_schema, sdk_client, start_date, field_list)
-        start_date = start_date+relativedelta(days=1)
+    max_end_date = utils.now() - relativedelta(days=1)
+    required_end_date = get_end_date()
+
+    report_end_date = min(max_end_date, required_end_date)
+
+    next_start_date = start_date
+
+    start_plus_window = next_start_date + relativedelta(days=report_window_days)
+    end_date = min(start_plus_window, report_end_date)
+
+    while next_start_date <= report_end_date:
+        singer.log_info(
+            "syncing %s for %s - %s",
+            stream_name,
+            next_start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d")
+        )
+        actual_end_date = min(end_date, report_end_date)
+        sync_report_for_day(stream_name, stream_schema, sdk_client, next_start_date, field_list, actual_end_date)
+        next_start_date = end_date+relativedelta(days=1)
+
+        start_plus_window = next_start_date + relativedelta(days=report_window_days)
+        end_date = start_plus_window
+
         bookmarks.write_bookmark(STATE,
                                  state_key_name(customer_id, stream_name),
                                  'last_attribution_window_date',
-                                 start_date.strftime(utils.DATETIME_FMT))
+                                 actual_end_date.strftime(utils.DATETIME_FMT))
         singer.write_state(STATE)
-    bookmarks.clear_bookmark(STATE,
-                             state_key_name(customer_id, stream_name),
-                             'last_attribution_window_date')
+    if not is_incremental:
+        bookmarks.clear_bookmark(STATE,state_key_name(customer_id, stream_name),'last_attribution_window_date')
     singer.write_state(STATE)
     LOGGER.info("Done syncing the %s report for customer_id %s", stream_name, customer_id)
 
@@ -326,9 +357,14 @@ def attempt_download_report(report_downloader, report):
         include_zero_impressions=False)
     return result
 
-def sync_report_for_day(stream_name, stream_schema, sdk_client, start, field_list): # pylint: disable=too-many-locals
+def sync_report_for_day(stream_name, stream_schema, sdk_client, start, field_list, end_date=None): # pylint: disable=too-many-locals
     report_downloader = sdk_client.GetReportDownloader(version=VERSION)
     customer_id = sdk_client.client_customer_id
+
+    max_date = min_date = start.strftime('%Y%m%d')
+    if end_date is not None:
+        max_date = end_date.strftime('%Y%m%d')
+
     report = {
         'reportName': 'Seems this is required',
         'dateRangeType': 'CUSTOM_DATE',
@@ -336,12 +372,14 @@ def sync_report_for_day(stream_name, stream_schema, sdk_client, start, field_lis
         'downloadFormat': 'CSV',
         'selector': {
             'fields': field_list,
-            'dateRange': {'min': start.strftime('%Y%m%d'),
-                          'max': start.strftime('%Y%m%d')}}}
+            'dateRange': {'min': min_date,
+                          'max': max_date}}}
+
 
      # Fetch the report as a csv string
     with metrics.http_request_timer(stream_name):
         result = attempt_download_report(report_downloader, report)
+
 
     headers, csv_reader = parse_csv_stream(result)
     with metrics.record_counter(stream_name) as counter:
