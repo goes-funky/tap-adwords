@@ -198,6 +198,7 @@ def add_synthetic_keys_to_stream_schema(stream_schema):
 
 def sync_report(stream_name, stream_metadata, sdk_client):
 
+
     report_window_days = CONFIG.get("MAX_REPORT_TIME_WINDOW", 365)
 
     is_incremental = False
@@ -357,9 +358,32 @@ def attempt_download_report(report_downloader, report):
         include_zero_impressions=False)
     return result
 
+
+def is_manager_account(sdk_client) -> bool:
+    manager_service = sdk_client.GetService("ManagedCustomerService")
+
+    selector = {
+        'fields': ['CanManageClients', "CustomerId"]
+    }
+
+    result = manager_service.get(selector)
+    if "entries" not in result:
+        return False
+    if len(result["entries"]) < 1:
+        return False
+    if len(result["entries"]) > 1:
+        return True
+    return result["entries"][0]["canManageClients"]
+
+
 def sync_report_for_day(stream_name, stream_schema, sdk_client, start, field_list, end_date=None): # pylint: disable=too-many-locals
     report_downloader = sdk_client.GetReportDownloader(version=VERSION)
     customer_id = sdk_client.client_customer_id
+
+
+    if is_manager_account(sdk_client):
+        singer.logger.log_warning("customer_id " + str(customer_id) + " is a manager, ignore for report")
+        return
 
     max_date = min_date = start.strftime('%Y%m%d')
     if end_date is not None:
