@@ -110,6 +110,10 @@ VERIFIED_REPORTS = frozenset([
     #'UNKNOWN'
 ])
 
+REPORTS_REQUIRING_DAILY_REPORTS = frozenset([
+'CLICK_PERFORMANCE_REPORT'
+])
+
 REPORTS_WITH_90_DAY_MAX = frozenset([
     'CLICK_PERFORMANCE_REPORT',
 ])
@@ -198,7 +202,6 @@ def add_synthetic_keys_to_stream_schema(stream_schema):
 
 def sync_report(stream_name, stream_metadata, sdk_client):
 
-
     report_window_days = CONFIG.get("MAX_REPORT_TIME_WINDOW", 365)
 
     is_incremental = False
@@ -211,7 +214,6 @@ def sync_report(stream_name, stream_metadata, sdk_client):
     stream_schema = add_synthetic_keys_to_stream_schema(stream_schema)
 
     xml_attribute_list = get_fields_to_sync(stream_schema, stream_metadata)
-
 
     primary_keys = metadata.get(stream_metadata, (), 'tap-adwords.report-key-properties') or []
     LOGGER.info("{} primary keys are {}".format(stream_name, primary_keys))
@@ -234,7 +236,11 @@ def sync_report(stream_name, stream_metadata, sdk_client):
     if stream_name in REPORTS_WITH_90_DAY_MAX:
         cutoff = utils.now()+relativedelta(days=-90)
         if start_date < cutoff:
+            LOGGER.warning("report only supports up to 90 days, will start at {}".format(start_date))
             start_date = cutoff
+
+    start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+
 
     LOGGER.info('Selected fields: %s', field_list)
 
@@ -242,10 +248,14 @@ def sync_report(stream_name, stream_metadata, sdk_client):
     required_end_date = get_end_date()
 
     report_end_date = min(max_end_date, required_end_date)
+    report_end_date = report_end_date.replace(hour=23, minute=59, second=59, microsecond=0)
 
     next_start_date = start_date
 
-    start_plus_window = next_start_date + relativedelta(days=report_window_days)
+    is_single_day_report = stream_name in REPORTS_REQUIRING_DAILY_REPORTS
+    start_plus_window = next_start_date
+    if not is_single_day_report:
+        start_plus_window += relativedelta(days=report_window_days)
     end_date = min(start_plus_window, report_end_date)
 
     while next_start_date <= report_end_date:
@@ -259,7 +269,10 @@ def sync_report(stream_name, stream_metadata, sdk_client):
         sync_report_for_day(stream_name, stream_schema, sdk_client, next_start_date, field_list, actual_end_date)
         next_start_date = end_date+relativedelta(days=1)
 
-        start_plus_window = next_start_date + relativedelta(days=report_window_days)
+        start_plus_window = next_start_date
+        if not is_single_day_report:
+            start_plus_window += relativedelta(days=report_window_days)
+
         end_date = start_plus_window
 
         bookmarks.write_bookmark(STATE,
@@ -315,8 +328,8 @@ def transform_pre_hook(data, typ, schema): # pylint: disable=unused-argument
 
     return data
 
-RETRY_SLEEP_TIME = 60
-MAX_ATTEMPTS = 3
+RETRY_SLEEP_TIME = 5
+MAX_ATTEMPTS = 5
 def with_retries_on_exception(sleepy_time, max_attempts):
     def wrap(some_function):
         def wrapped_function(*args):
@@ -330,9 +343,11 @@ def with_retries_on_exception(sleepy_time, max_attempts):
                 ex = our_ex
 
             while ex and attempts < max_attempts:
+                sleep_now = sleepy_time ** attempts
+                LOGGER.warning("recoverably exception: {}".format(str(ex)))
                 LOGGER.warning("attempt {} of {} failed".format(attempts, some_function))
-                LOGGER.warning("waiting {} seconds before retrying".format(sleepy_time))
-                time.sleep(RETRY_SLEEP_TIME)
+                LOGGER.warning("waiting {} seconds before retrying".format(sleep_now))
+                time.sleep(sleep_now)
                 try:
                     ex = None
                     result = some_function(*args)
@@ -380,7 +395,6 @@ def sync_report_for_day(stream_name, stream_schema, sdk_client, start, field_lis
     report_downloader = sdk_client.GetReportDownloader(version=VERSION)
     customer_id = sdk_client.client_customer_id
 
-
     if is_manager_account(sdk_client):
         singer.logger.log_warning("customer_id " + str(customer_id) + " is a manager, ignore for report")
         return
@@ -398,7 +412,6 @@ def sync_report_for_day(stream_name, stream_schema, sdk_client, start, field_lis
             'fields': field_list,
             'dateRange': {'min': min_date,
                           'max': max_date}}}
-
 
      # Fetch the report as a csv string
     with metrics.http_request_timer(stream_name):
@@ -923,6 +936,8 @@ def do_sync(properties, sdk_client):
         else:
             LOGGER.info('Skipping stream %s.', stream_name)
 
+
+@with_retries_on_exception(RETRY_SLEEP_TIME, MAX_ATTEMPTS)
 def get_report_definition_service(report_type, sdk_client):
     report_definition_service = sdk_client.GetService(
         'ReportDefinitionService', version=VERSION)
@@ -1039,6 +1054,7 @@ def check_selected_fields(stream, field_list, sdk_client):
                 advice_message,
                 "\n\t".join(errors)))
 
+
 def do_discover_reports(sdk_client):
     url = 'https://adwords.google.com/api/adwords/reportdownload/{}/reportDefinition.xsd'.format(VERSION)
     xsd = request_xsd(url)
@@ -1120,7 +1136,8 @@ def main():
         main_impl()
     except Exception as exc:
         LOGGER.critical(exc)
-        raise exc
+        sys.stderr.flush()
+        exit(1)
 
 if __name__ == "__main__":
     main()
